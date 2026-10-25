@@ -1,0 +1,283 @@
+
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1">
+  <title>ESP32 Webcam OLED</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 520px;
+      margin: 20px auto;
+      padding: 0 14px;
+      background: #101820;
+      color: #f4f7fa;
+    }
+    h2 { font-size: 1.35rem; }
+    video, canvas {
+      width: 100%;
+      max-width: 480px;
+      background: #000;
+      border-radius: 8px;
+    }
+    canvas {
+      image-rendering: pixelated;
+      border: 1px solid #667;
+    }
+    button {
+      padding: 12px;
+      margin: 5px 3px 5px 0;
+      border: 0;
+      border-radius: 8px;
+      font-size: 1rem;
+    }
+    #status {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      padding: 10px;
+      background: #263442;
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+  <h2>ESP32 Webcam → OLED</h2>
+
+  <p>Camera trực tiếp, chuyển thành ảnh đen trắng 128×64.</p>
+
+  <video id="video" autoplay playsinline muted></video>
+
+  <p>
+    <button id="cameraBtn">1. Bật camera</button>
+    <button id="connectBtn">2. Kết nối ESP32</button>
+    <button id="stopBtn">Dừng</button>
+  </p>
+
+  <h3>Xem trước ảnh OLED</h3>
+  <canvas id="preview" width="128" height="64"></canvas>
+
+  <p id="status">Sẵn sàng. Kết nối Wi-Fi ESP32 trước khi truyền.</p>
+
+<script>
+"use strict";
+
+const ESP_WS_URL = "ws://192.168.4.1:81/";
+const WIDTH = 128;
+const HEIGHT = 64;
+const FRAME_BYTES = WIDTH * HEIGHT / 8;
+const SEND_INTERVAL_MS = 200; // 5 FPS target
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("preview");
+const ctx = canvas.getContext("2d", {
+  alpha: false,
+  willReadFrequently: true
+});
+const statusEl = document.getElementById("status");
+
+let cameraStream = null;
+let ws = null;
+let sendTimer = null;
+let sending = false;
+let framesSent = 0;
+let lastSend = 0;
+
+function status(text) {
+  statusEl.textContent = text;
+}
+
+async function startCamera() {
+  try {
+    if (!navigator.mediaDevices ||
+        !navigator.mediaDevices.getUserMedia) {
+      throw new Error(
+        "Trình duyệt không hỗ trợ camera ở ngữ cảnh này. " +
+        "Hãy mở trang HTTPS trên Chrome Android."
+      );
+    }
+
+    stopCamera();
+
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 320 },
+        height: { ideal: 240 },
+        frameRate: { ideal: 15, max: 20 }
+      }
+    });
+
+    video.srcObject = cameraStream;
+    await video.play();
+
+    status(
+      "Camera hoạt động.\n" +
+      "Kết nối Wi-Fi ESP32 rồi nhấn Kết nối ESP32."
+    );
+  } catch (err) {
+    status("Không mở được camera: " + err.message);
+  }
+}
+
+function stopCamera() {
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(track => track.stop());
+    cameraStream = null;
+  }
+  video.srcObject = null;
+}
+
+function connectESP32() {
+  if (ws && (
+      ws.readyState === WebSocket.OPEN ||
+      ws.readyState === WebSocket.CONNECTING
+  )) {
+    status("WebSocket đang kết nối hoặc đã kết nối.");
+    return;
+  }
+
+  try {
+    status(
+      "Đang kết nối " + ESP_WS_URL + "\n" +
+      "Nếu trình duyệt hỏi quyền mạng cục bộ, hãy xem xét " +
+      "cấp quyền cho kết nối tới ESP32."
+    );
+
+    ws = new WebSocket(ESP_WS_URL);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      status("WebSocket đã kết nối.\nSẵn sàng truyền camera.");
+      startSending();
+    };
+
+    ws.onerror = () => {
+      status(
+        "Lỗi WebSocket. Kiểm tra Wi-Fi ESP32, IP, cổng 81 " +
+        "và quyền truy cập mạng cục bộ của trình duyệt."
+      );
+    };
+
+    ws.onclose = () => {
+      stopSending();
+      status("WebSocket đã ngắt kết nối.");
+    };
+  } catch (err) {
+    status("Không tạo được WebSocket: " + err.message);
+  }
+}
+
+function makeBitmap() {
+  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+      !video.videoWidth || !video.videoHeight) {
+    return null;
+  }
+
+  // Scale to OLED resolution.
+  ctx.drawImage(video, 0, 0, WIDTH, HEIGHT);
+
+  const image = ctx.getImageData(0, 0, WIDTH, HEIGHT);
+  const pixels = image.data;
+  const bitmap = new Uint8Array(FRAME_BYTES);
+
+  for (let y = 0; y < HEIGHT; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      const p = (y * WIDTH + x) * 4;
+      const gray = (
+        299 * pixels[p] +
+        587 * pixels[p + 1] +
+        114 * pixels[p + 2]
+      ) / 1000;
+
+      // Match Adafruit GFX: MSB first within each byte.
+      if (gray >= 128) {
+        const bit = y * WIDTH + x;
+        bitmap[bit >> 3] |= 0x80 >> (x & 7);
+      }
+    }
+  }
+
+  return bitmap;
+}
+
+function sendFrame() {
+  if (!sending || !ws || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  // Avoid accumulating stale frames in the network buffer.
+  if (ws.bufferedAmount > FRAME_BYTES * 3) {
+    return;
+  }
+
+  const bitmap = makeBitmap();
+  if (!bitmap || bitmap.byteLength !== FRAME_BYTES) return;
+
+  try {
+    ws.send(bitmap.buffer);
+    framesSent++;
+    lastSend = performance.now();
+
+    if (framesSent % 10 === 0) {
+      status(
+        "WebSocket: connected\n" +
+        "Đã gửi " + framesSent + " khung hình\n" +
+        "Mục tiêu: 5 FPS"
+      );
+    }
+  } catch (err) {
+    status("Lỗi gửi ảnh: " + err.message);
+  }
+}
+
+function startSending() {
+  if (sending) return;
+
+  if (!cameraStream) {
+    status("Hãy bật camera trước.");
+    return;
+  }
+
+  sending = true;
+  framesSent = 0;
+  sendTimer = setInterval(sendFrame, SEND_INTERVAL_MS);
+  status("Đang truyền camera đến ESP32...");
+}
+
+function stopSending() {
+  sending = false;
+
+  if (sendTimer !== null) {
+    clearInterval(sendTimer);
+    sendTimer = null;
+  }
+}
+
+function stopAll() {
+  stopSending();
+  stopCamera();
+
+  if (ws) {
+    const oldSocket = ws;
+    ws = null;
+    oldSocket.close();
+  }
+
+  status("Đã dừng camera và truyền dữ liệu.");
+}
+
+document.getElementById("cameraBtn").addEventListener(
+  "click", startCamera
+);
+document.getElementById("connectBtn").addEventListener(
+  "click", connectESP32
+);
+document.getElementById("stopBtn").addEventListener(
+  "click", stopAll
+);
+</script>
+</body>
+</html>
